@@ -1,0 +1,469 @@
+<?php
+ini_set('error_log', __DIR__ . '/php_errors_' . date("Ymd", time()) . '.log');
+ini_set('log_errors', 1);
+$_GET['key'] = 'tmp';
+include_once(dirname(__FILE__) . '/../../_dev/_lib/init.php');
+include_once(__DIR__ .'/../../_sys/system.php');
+HU::logSetup(dirname(__FILE__) . '/logs/' . 'events_' . date('Y-m-d') . '.log');
+HU::log('------START------');
+HAmo::InitAmoApi();
+//Получаем список клиентов, у которых включен наш виджет
+$query = HU::setQueryParams(
+    'SELECT * FROM client_widget WHERE widget_id=:widget_id AND params->>"$.frontend_status"=:frontend_status',
+    array(
+        ':widget_id' => 310,
+        ':frontend_status' => 'true'
+    )
+);
+$arrayOfClients = getQueryList($query, 'clid');
+//перебираем всех клиентов
+foreach ($arrayOfClients as $key => $value) {
+    $clid = $key;
+    $clientWidget = \Yadro\Models\ClientWidget::getClientWidget($clid, 310);
+    //проверяем активен ли виджет
+    if(!$clientWidget->getActivity()){
+        continue;
+    }
+    $params = json_decode($value['params'], true);
+    HU::log('Параметры виджета happy_birthday у клиента clid='.$clid);
+    HU::log($params);
+    //Если не указано поле с Датой рождения - пропускаем этот контакт
+    if ($params['field'] && $params['field']['id'] != '-1') {
+        $fieldId = $params['field']['id'];
+        $client = \Yadro\Models\YadroUser::getByClid($clid);
+        $apiKey = $client->api;
+        $yadroKey = key_Get($clid);
+        $currentDate = date('d.m.Y');
+        $currentDateForCheck = date('m-d');
+        Introvert\Configuration::getDefaultConfiguration()->setApiKey('key', $apiKey);
+        $api = new Introvert\ApiClient();
+        $fields = $api->account->fields()['result'];
+        //Проверяем, есть ли вообще в аккаунте такое поле
+        if(!checkFieldInClient($fields, $fieldId)){
+            HU::log('Поля с id='.$fieldId.', которое указано в настройках не существует');
+            continue;
+        }
+        //формируем запрос для поиска контактов, у которых поле с id=$fieldId имеет значение ,
+        // равное сегодняшнему числу
+        $contactsCount = 300;
+        $data = [
+            'url' => '/ajax/contacts/list/',
+            'headers' => [
+                'X-Requested-With: XMLHttpRequest',
+            ],
+            'params' => [
+                'limit_rows' => $contactsCount,
+                'filter[cf]['.$fieldId.'][from]' => $currentDate,
+                'filter[cf]['.$fieldId.'][to]' => $currentDate,
+                'useFilter' => 'y',
+                'element_type' => 2,
+            ]
+        ];
+        $response = $api->yadro->sendToAmo($data);
+        $arrayOfContacts = $response['result']['response']['items'];
+        //если кол-во контактов равно нашему ограничению, то возможно,что надо отправить еще запросы,
+        // чтобы собрать все контакты. Для этого запускаем getAllContacts
+        if (is_array($arrayOfContacts) && count($arrayOfContacts) ===  $contactsCount){
+            $arrayOfContacts = getAllContacts($arrayOfContacts, $contactsCount, $api, $fieldId, $currentDate);
+        }
+        if ($arrayOfContacts){
+            HU::log('У клиента найдены контакты, у которых значения поля '.$fieldId.' равно сегодняшнему числу '.$currentDate);
+            HU::log('Список контактов');
+            HU::log($arrayOfContacts);
+            $count = 0;
+            foreach ($arrayOfContacts as $item){
+                $contactId = $item['id'];
+                HU::log('Контакт '.$contactId);
+                try {
+                    $contact = $api->contact->getById($contactId)['result'];
+                } catch (Exception $e) {
+                    HU::log( 'Exception when api->contact->getById('.$contactId.'): '.$e->getMessage());
+                    continue;
+                }
+                if (!checkField($contact, $fieldId, $currentDateForCheck)){
+                    HU::log('Ошибка. Результат запроса не совпадает с реальным значением поля!');
+                    continue;
+                }
+                //делаем задержку, так как при частом отправлении Амо выдает ошибку "Превышен лимит"
+                // , но здесь это отследить нельзя, тк возвращается - "Успешно"
+                if($count === 1){
+                    $count = 0;
+                    HU::log("перерыв 40 сек--------------------------------------------------");
+                    sleep(40);
+                    HU::log("перерыв  закончился---------------------------------------------");
+                }
+
+                sendMail($params, $contact, $client, $yadroKey, $api);
+                sendSms($params, $contact, $client, $yadroKey, $api);
+            }
+        } else {
+            HU::log('У клиента не найдены контакты, у которых значения поля '.$fieldId.' равно сегодняшнему числу '.$currentDate);
+        }
+    } else {
+        HU::log('У клиента не установлено поле в настройках');
+    }
+}
+//проверяет наличие поля у клиента
+function checkFieldInClient($cf, $fieldId){
+    $res = false;
+    foreach ($cf as $field){
+        if($field['id'] == $fieldId){
+            $res = true;
+            break;
+        }
+    }
+    return $res;
+}
+//функция для поиска всех контактов, если их кол-во не помещается в одну страницу
+function getAllContacts($arrayOfContacts, $contactsCount, $api, $fieldId, $currentDate){
+    $page = 1;
+    do {
+        $data = [
+            'url' => '/ajax/contacts/list/',
+            'headers' => [
+                'X-Requested-With: XMLHttpRequest',
+            ],
+            'params' => [
+                'limit_offset' => $contactsCount*$page,
+                'limit_rows' => $contactsCount,
+                'filter[cf]['.$fieldId.'][from]' => $currentDate,
+                'filter[cf]['.$fieldId.'][to]' => $currentDate,
+                'useFilter' => 'y',
+                'element_type' => 2,
+            ]
+        ];
+        $page++;
+        $res = $api->yadro->sendToAmo($data);
+        if (is_array($res['result']['response']['items'])){
+            $arrayOfContacts = array_merge($arrayOfContacts, $res['result']['response']['items']);
+        }
+    } while(count($res['result']['response']['items']) === $contactsCount);
+    return $arrayOfContacts;
+}
+//функция для дополнительной проверки соответствия значения поля сегодняшнему числу
+function checkField($contact, $fieldId, $currentDate){
+    $result = false;
+
+    $cf = $contact['custom_fields'];
+    foreach ($cf as $field){
+        if ($fieldId == $field['id']){
+            $birthdayDate = substr($field['values'][0]['value'], 5, 5);
+            if ($birthdayDate === $currentDate){
+                $result = true;
+                break;
+            } else {
+                HU::log("Ошибка!Результат запроса не совпадает с реальным значением поля");
+            }
+            break;
+        }
+    }
+    return $result;
+}
+//функция, которая ищет поле с телефоном и возвращает номер
+function getPhone($contact) {
+    $phone = false;
+    foreach ($contact['custom_fields'] as $value) {
+        if(isset($value['code']) && $value['code'] === 'PHONE'){
+            $phone = $value['values'][0]['value'];
+            break;
+        }
+    }
+    return $phone;
+}
+//функция возвращает email контакта
+function getEmail($contact) {
+    $email = false;
+    foreach ($contact['custom_fields'] as $value) {
+        if(isset($value['code']) && $value['code'] === 'EMAIL'){
+            $email = $value['values'][0]['value'];
+            break;
+        }
+    }
+    return $email;
+}
+//добавляет информацию об отправлении в файл
+function addSendingData($key,$value){
+    $currentDate = date('Ymd');
+    $fileName = __DIR__.'/data/hb_data'.$currentDate.'.log';
+    $file = fopen($fileName,'a');
+    fwrite($file, $key.':'.$value.';'.PHP_EOL);
+}
+//функция для проверки, отправляли ли мы уже письмо в этот день данному контакту или нет
+function checkSendingData($key, $value){
+    $result = false;
+    $currentDate = date('Ymd');
+    $fileName = __DIR__.'/data/hb_data'.$currentDate.'.log';
+    $file = file_get_contents($fileName);
+    if(!$file) {
+        return false;
+    }
+    if(strpos($file,$key) !== false){
+        $offset = strripos($file,$key) + strlen($key)+1;
+        $end = strpos($file,';',$offset);
+        $val = substr($file,$offset,$end-$offset);
+        HU::log('val');
+        HU::log($val);
+        if($val == $value){
+            $result = true;
+        }
+    }
+    return $result;
+}
+//функция для отправки email
+function sendMail($params, $contact, $client, $yadroKey, $api) {
+    global $count;
+    //проверяем отправляли мы письмо или нет, тк возмодно дублирование
+    if (checkSendingData('hbemail'.$contact['id'], date('dmY'))){
+        HU::log('Email данному контакту уже было отправлено');
+        return;
+    }
+    $templateForUnsuccessNotice = array (
+        'element_id' => $contact['id'],
+        'element_type' => '1',
+        'params' => [
+            'text' => '',
+            'service' => 'День рождения'
+        ],
+        'note_type' => '25',
+        'responsible_user_id' => $contact['responsible_user_id']
+    );
+    HU::log('функция sendMail');
+    if(!isset($params['emailTemplate']) || $params['emailTemplate']['id'] == -1){
+        HU::log('Шаблон для почты не установлен');
+        return;
+    }
+    $email = getEmail($contact);
+    if(!$email){
+        HU::log('У контакта email не указан');
+        return;
+    }
+    try {
+        //устанавливаем get параметр key для функции  \HAmo::getElementParams, инвче она булет возвращать неполные параметры
+        $_GET['key'] = $yadroKey;
+        $templateId = $params['emailTemplate']['id'];
+        try {
+            $template = $api->mail->getTemplate($templateId);
+            HU::log('Шаблон');
+            HU::log($template);
+            if (!$template['result']){
+                $templateForUnsuccessNotice['params']['text'] = 'Сообщение с поздравлением не отправлено.Не удалось найти шаблон для письма';
+                $body = $templateForUnsuccessNotice;
+                makeNotice($api, $body);
+                return;
+            }
+        } catch (Exception $e) {
+            HU::log('Exception when calling MailApi->getTemplate: '.$e->getMessage());
+            $templateForUnsuccessNotice['params']['text'] = 'Сообщение с поздравлением не отправлено.Не удалось найти шаблон для письма';
+            $body = $templateForUnsuccessNotice;
+            makeNotice($api, $body);
+            return;
+        }
+        $msg = $template['result']['fields']['content'];
+        $managers = $client->account['users'];
+        $manager = [];
+        foreach ($managers as $value){
+            if($value['id'] == $contact['responsible_user_id']){
+                $manager = $value;
+                break;
+            }
+        }
+        $par = \HAmo::getElementParams(null, $contact, null,  $manager);
+        $msg = html_entity_decode(\HU::replaceTemplate($msg, $par));
+        $msg = IntrConditionParser::parse($msg);
+        //формируем массив для отправки email
+
+
+        try {
+            $result = $api->mail->getMailboxes()['result'];
+        } catch (Exception $e) {
+            HU::log('Не удалось получить данные о почтовых ящиках аккаунта'.$e->getMessage());
+            $templateForUnsuccessNotice['params']['text'] = 'Сообщение с поздравлением не отправлено.Не удалось получить данные о почтовых ящиках аккаунта';
+            $body = $templateForUnsuccessNotice;
+            makeNotice($api, $body);
+            return;
+        }
+        $privateMailbox = '';
+        $corpMailbox = '';
+        foreach ($result as $mailbox){
+            if($mailbox['user_id'] == $contact['responsible_user_id']){
+                $privateMailbox = $mailbox;
+                break;
+            }
+            if (!$mailbox['private'] && !$corpMailbox){
+                $corpMailbox = $mailbox;
+            }
+        }
+        if($privateMailbox){
+            $emailFrom = $privateMailbox['id'];
+            $nameFrom = $privateMailbox['email'];
+        } else {
+            if ($corpMailbox){
+                $emailFrom = $corpMailbox['id'];
+                $nameFrom = $corpMailbox['email'];
+            } else {
+                HU::log('Не удалось найти почтовый ящик для отправки письма');
+                $templateForUnsuccessNotice['params']['text'] = 'Сообщение с поздравлением не отправлено.Не удалось найти почтовый ящик для отправки письма';
+                $body = $templateForUnsuccessNotice;
+                makeNotice($api, $body);
+                return;
+            }
+        }
+        $arr = [
+            'msg' => $msg,
+            'subject' => $template['result']['fields']['subject'],
+            'from' => [
+                'email' => $emailFrom,
+                'name' => $nameFrom
+            ],
+            'to' => [
+                [
+                    'email' => $email,
+                    "name" => $contact['name']
+                ]
+            ],
+            'additional_data' => [
+                'entity_id' => $contact['id'],
+                'entity_type' => 'contact',
+                'service' => 'amocrm'
+            ]
+        ];
+        HU::log('Массив для отправки email');
+        HU::log($arr);
+        $body = new \Introvert\Model\Mail($arr);
+        try {
+            $result = $api->mail->send($body);
+            HU::log('Результат отправки');
+            HU::log($result);
+        } catch (Exception $e) {
+            HU::log('Exception when calling MailApi->send: '.$e->getMessage());
+            $templateForUnsuccessNotice['params']['text'] = 'Сообщение с поздравлением не отправлено.Ошибка при отправке';
+            $body = $templateForUnsuccessNotice;
+            makeNotice($api, $body);
+            return;
+        }
+        if($result['code'] !== 1){
+            throw new Exception($result['message']);
+        } else {
+            //увеличиваем $count для того ,чтобы включить задержку, и добавляем данные об отправке
+            // , чтбы не было дублирования
+            $count++;
+            addSendingData('hbemail'.$contact['id'], date('dmY'));
+        }
+    } catch (Exception $e) {
+        HU::log('Сообщение с поздравлением не отправлено.'.$e->getMessage());
+        $templateForUnsuccessNotice['params']['text'] = 'Сообщение с поздравлением не отправлено.';
+        $body = $templateForUnsuccessNotice;
+        makeNotice($api, $body);
+        return;
+    }
+}
+//функция для отправки смс
+function sendSms($params, $cont, $client, $yKey, $api) {
+    $templateForUnsuccessSms = array(
+        'element_id' => $cont['id'],
+        'element_type' => '1',
+        'params' => [
+            'text' => '',
+            'service' => 'День рождения'
+        ],
+        'note_type' => '25',
+        'responsible_user_id' => $cont['responsible_user_id']
+    );
+    $tel = getPhone($cont);
+    if(!$tel){
+        HU::log('У контакта не указан телефон');
+        return;
+    }
+    //проверяем отправляли мы смс или нет, тк возмодно дублирование
+    if (checkSendingData('hbsms'.$cont['id'], date('dmY'))){
+        HU::log('Смс данному контакту уже было отправлено');
+        return;
+    }
+    HU::log('Функция sendSms');
+    //ПРоверяем , выбран ли какой-нибудь смс шаблон или нет
+    if(isset($params['smsTemplate']) && $params['smsTemplate']['id'] != -1){
+        $smsService = $client->sms;
+        $smsServiceData = $client->services[$smsService];
+        //устанавливаем ключ для функции widgetGetParams
+        $_GET['key'] = $yKey;
+        HU::log('СМС сервис');
+        HU::log($smsService);
+        HU::log('Данные для СМС сервиса');
+        HU::log($smsServiceData);
+        $smsService = new \Yadro\Services\YadroSmsService($client);
+        //вытаскиваем из dpsms текст выбранного шаблона, если шаблон с таким id есть
+        $dpsmsParams = json_decode(widgetGetParams('dpsms'), true);
+        $templateId = $params['smsTemplate']['id'];
+        if (isset($dpsmsParams['sms_templates'][$templateId])){
+            $managers = $client->account['users'];
+            $manager = [];
+            foreach ($managers as $value){
+                if($value['id'] == $cont['responsible_user_id']){
+                    $manager = $value;
+                    break;
+                }
+            }
+            $template = $dpsmsParams['sms_templates'][$templateId]['body'];
+            $par = \HAmo::getElementParams(null, $cont, null, $manager);
+            $text = \HU::replaceTemplate($template, $par);
+            $from = $dpsmsParams['sms_templates'][$templateId]['sender'] ? $dpsmsParams['sms_templates'][$templateId]['sender'] : null;
+
+            HU::log('Данные для отправки смс: телефон: '.$tel.'; Текст: '.$text.'; От: '.$from);
+            try {
+                $response = $smsService->sendSms($tel, $text, $from);
+                HU::log('Результат отправки');
+                HU::log($response);
+            } catch (Exception $e){
+                HU::log('Смс не отправлено.'.$e->getMessage());
+                $templateForUnsuccessSms['params']['text'] = 'Смс с поздравлением не отправлено.';
+                $body = $templateForUnsuccessSms;
+                makeNotice($api, $body);
+                return;
+
+            }
+
+            //формируем массив для примечания
+            if ($response['status'] == 1) {
+                //добавляем данные об отправке чтбы не было дублирования
+                addSendingData('hbsms'.$cont['id'], date('dmY'));
+                $data = array(
+                    'element_id' => $cont['id'],
+                    'element_type' => '1',
+                    'params' => [
+                        'text' => $text,
+                        'phone' => $tel
+                    ],
+                    'note_type' => '103',
+                    'responsible_user_id' => $cont['responsible_user_id']
+                );
+                //если шаблон есть , но сообщение не было отправлено
+            } else {
+                HU::log('Сообщение не удалось отправить');
+                $templateForUnsuccessSms['params']['text'] = 'Смс с поздравлением не отправлено.';
+                $data = $templateForUnsuccessSms;
+            }
+            //если в настройках dpsms не найден шаблон с id из настроек нашего виджета
+        } else {
+            HU::log('В настройках dpsms не найден шаблон с id из настроек нашего виджета');
+            $templateForUnsuccessSms['params']['text'] = 'Смс с поздравлением не отправлено.Не найден шаблон для сообщения с поздравлением';
+            $data = $templateForUnsuccessSms;
+        }
+        makeNotice($api, $data);
+    } else {
+        HU::log('Не выбран шаблон для смс');
+    }
+    $_GET['key'] = '';
+}
+//функция для создания примечания
+function makeNotice($api, $body){
+    HU::log('Массив, для создания примечания');
+    HU::log($body);
+    try {
+        $result = $api->note->create($body);
+        HU::log('Результат создания примечания');
+        HU::log($result);
+    } catch (Exception $e) {
+        HU::log('Примечание не было создано');
+        HU::log('Exception when calling NoteApi->create: '.$e->getMessage());
+    }
+}
